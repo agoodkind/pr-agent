@@ -1,0 +1,132 @@
+name: Publish fork image
+
+on:
+  push:
+    branches: [main]
+concurrency: {group: publish-fork-image, cancel-in-progress: false}
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    permissions: {contents: read}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.12"
+      - name: Validate source and image
+        run: |
+          set -euo pipefail
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+          python -m pytest -q tests/unittest
+          docker build --target github_app --tag pr-agent-fork-check -f docker/Dockerfile .
+          python -m pytest -q tests/fork/test_github_app_image.py
+
+  publish:
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions: {contents: read, packages: write}
+    outputs:
+      digest: ${{ steps.digest.outputs.digest }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130  # v3.7.0
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3.12.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Select immutable tags
+        id: tags
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          release="ghcr.io/agoodkind/pr-agent:upstream-v0.42.0-lifecycle-v1"
+          if ! versions=$(gh api --paginate --slurp \
+            'users/agoodkind/packages/container/pr-agent/versions?per_page=100' 2>&1); then
+            if [[ "$versions" != *"HTTP 404"* ]]; then
+              printf '%s\n' "$versions" >&2
+              exit 1
+            fi
+            versions='[[]]'
+          fi
+          sha_digest=$(jq -r --arg tag "sha-${GITHUB_SHA}" \
+            '[.[][] | select(any(.metadata.container.tags[]?; . == $tag)) | .name][0] // empty' \
+            <<< "$versions")
+          if [[ -n "$sha_digest" ]]; then
+            printf 'digest=%s\npush=false\n' "$sha_digest" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          tags="ghcr.io/agoodkind/pr-agent:sha-${GITHUB_SHA}"
+          if ! jq -e --arg tag "${release##*:}" \
+            'any(.[][]; any(.metadata.container.tags[]?; . == $tag))' \
+            <<< "$versions" > /dev/null; then
+            tags="${tags},${release}"
+          fi
+          printf 'push=true\ntags=%s\n' "$tags" >> "$GITHUB_OUTPUT"
+      - name: Build and publish image
+        if: steps.tags.outputs.push == 'true'
+        id: push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: github_app
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+      - name: Verify and record digest
+        id: digest
+        env:
+          EXISTING_DIGEST: ${{ steps.tags.outputs.digest }}
+          PUSHED_DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          DIGEST="${EXISTING_DIGEST:-$PUSHED_DIGEST}"
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          docker buildx imagetools inspect "ghcr.io/agoodkind/pr-agent@${DIGEST}"
+          printf 'digest=%s\n' "$DIGEST" >> "$GITHUB_OUTPUT"
+          printf 'Published digest: %s\n' "$DIGEST" >> "$GITHUB_STEP_SUMMARY"
+
+  propose-consumer-update:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions: {contents: read}
+    steps:
+      - name: Open consumer pull request
+        env:
+          GH_TOKEN: ${{ secrets.PR_AGENT_CF_UPDATE_TOKEN }}
+          DIGEST: ${{ needs.publish.outputs.digest }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          : "${GH_TOKEN:?PR_AGENT_CF_UPDATE_TOKEN is required}"
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          repo="agoodkind/pr-agent-cf"
+          branch="update-pr-agent-${SOURCE_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          main_sha=$(gh api "repos/${repo}/git/ref/heads/main" --jq '.object.sha')
+          file=$(gh api "repos/${repo}/contents/Dockerfile?ref=main")
+          file_sha=$(jq -r '.sha' <<< "$file")
+          dockerfile=$(jq -r '.content | @base64d' <<< "$file")
+          pattern='^FROM (pragent/pr-agent:0\.42\.0-github_app|ghcr\.io/agoodkind/pr-agent)@sha256:[0-9a-f]{64}$'
+          [[ $(grep -c '^FROM ' <<< "$dockerfile") -eq 1 ]]
+          grep -Eq "$pattern" <<< "${dockerfile%%$'\n'*}"
+
+          gh api --method POST "repos/${repo}/git/refs" \
+            -f ref="refs/heads/${branch}" -f sha="$main_sha"
+          from="FROM ghcr.io/agoodkind/pr-agent@${DIGEST}"
+          content=$(jq -r --arg from "$from" \
+            '.content | @base64d | sub("^[^\\n]*"; $from) | @base64' <<< "$file")
+          commit_sha=$(gh api --method PUT "repos/${repo}/contents/Dockerfile" \
+            -f message="Update PR-Agent image to ${DIGEST}" -f content="$content" \
+            -f sha="$file_sha" -f branch="$branch" --jq '.commit.sha')
+          verified=$(gh api "repos/${repo}/commits/${commit_sha}" \
+            --jq '.commit.verification.verified')
+          [[ "$verified" == "true" ]]
+          gh api --method POST "repos/${repo}/pulls" \
+            -f title="Update PR-Agent image for ${SOURCE_SHA}" -f head="$branch" \
+            -f base=main -f body="Use ghcr.io/agoodkind/pr-agent@${DIGEST}." \
+            --jq '.html_url'
