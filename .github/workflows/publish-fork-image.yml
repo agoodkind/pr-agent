@@ -110,7 +110,7 @@ jobs:
           main_sha=$(gh api "repos/${repo}/git/ref/heads/main" --jq '.object.sha')
           file=$(gh api "repos/${repo}/contents/Dockerfile?ref=main")
           file_sha=$(jq -r '.sha' <<< "$file")
-          dockerfile=$(jq -r '.content | @base64d' <<< "$file")
+          dockerfile=$(jq -r '.content | gsub("\\s"; "") | @base64d' <<< "$file")
           pattern='^FROM (pragent/pr-agent:0\.42\.0-github_app|ghcr\.io/agoodkind/pr-agent)@sha256:[0-9a-f]{64}$'
           [[ $(grep -c '^FROM ' <<< "$dockerfile") -eq 1 ]]
           grep -Eq "$pattern" <<< "${dockerfile%%$'\n'*}"
@@ -119,7 +119,8 @@ jobs:
             -f ref="refs/heads/${branch}" -f sha="$main_sha"
           from="FROM ghcr.io/agoodkind/pr-agent@${DIGEST}"
           content=$(jq -r --arg from "$from" \
-            '.content | @base64d | sub("^[^\\n]*"; $from) | @base64' <<< "$file")
+            '.content | gsub("\\s"; "") | @base64d | sub("^[^\\n]*"; $from) | @base64' \
+            <<< "$file")
           commit_sha=$(gh api --method PUT "repos/${repo}/contents/Dockerfile" \
             -f message="Update PR-Agent image to ${DIGEST}" -f content="$content" \
             -f sha="$file_sha" -f branch="$branch" --jq '.commit.sha')
