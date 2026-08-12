@@ -109,7 +109,6 @@ jobs:
           branch="update-pr-agent-${SOURCE_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           main_sha=$(gh api "repos/${repo}/git/ref/heads/main" --jq '.object.sha')
           file=$(gh api "repos/${repo}/contents/Dockerfile?ref=main")
-          file_sha=$(jq -r '.sha' <<< "$file")
           dockerfile=$(jq -r '.content | gsub("\\s"; "") | @base64d' <<< "$file")
           pattern='^FROM (pragent/pr-agent:0\.42\.0-github_app|ghcr\.io/agoodkind/pr-agent)@sha256:[0-9a-f]{64}$'
           [[ $(grep -c '^FROM ' <<< "$dockerfile") -eq 1 ]]
@@ -121,9 +120,14 @@ jobs:
           content=$(jq -r --arg from "$from" \
             '.content | gsub("\\s"; "") | @base64d | sub("^[^\\n]*"; $from) | @base64' \
             <<< "$file")
-          commit_sha=$(gh api --method PUT "repos/${repo}/contents/Dockerfile" \
-            -f message="Update PR-Agent image to ${DIGEST}" -f content="$content" \
-            -f sha="$file_sha" -f branch="$branch" --jq '.commit.sha')
+          # GraphQL variables must remain literal for gh to bind them.
+          # shellcheck disable=SC2016
+          commit_sha=$(gh api graphql \
+            -f query='mutation($repository:String!,$branch:String!,$head:GitObjectID!,$headline:String!,$path:String!,$contents:Base64String!){createCommitOnBranch(input:{branch:{repositoryNameWithOwner:$repository,branchName:$branch},message:{headline:$headline},expectedHeadOid:$head,fileChanges:{additions:[{path:$path,contents:$contents}]}}){commit{oid}}}' \
+            -f repository="$repo" -f branch="$branch" -f head="$main_sha" \
+            -f headline="Update PR-Agent image to ${DIGEST}" \
+            -f path=Dockerfile -f contents="$content" \
+            --jq '.data.createCommitOnBranch.commit.oid')
           verified=$(gh api "repos/${repo}/commits/${commit_sha}" \
             --jq '.commit.verification.verified')
           [[ "$verified" == "true" ]]
