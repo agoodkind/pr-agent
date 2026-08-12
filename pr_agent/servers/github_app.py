@@ -22,6 +22,7 @@ from pr_agent.git_providers.utils import apply_repo_settings
 from pr_agent.identity_providers import get_identity_provider
 from pr_agent.identity_providers.identity_provider import Eligibility
 from pr_agent.log import LoggingFormat, get_logger, setup_logger
+from pr_agent.servers.github_review_lifecycle import ReviewLifecycle
 from pr_agent.servers.utils import DefaultDictWithTimeout, verify_signature
 
 setup_logger(fmt=LoggingFormat.JSON, level=get_settings().get("CONFIG.LOG_LEVEL", "DEBUG"))
@@ -393,26 +394,62 @@ def _check_pull_request_event(action: str, body: dict, log_context: dict) -> Tup
 
 
 async def _perform_auto_commands_github(commands_conf: str, agent: PRAgent, body: dict, api_url: str,
-                                        log_context: dict):
+                                        log_context: dict) -> bool:
     apply_repo_settings(api_url)
     if commands_conf == "pr_commands" and get_settings().config.disable_auto_feedback:  # auto commands for PR, and auto feedback is disabled
         get_logger().info(f"Auto feedback is disabled, skipping auto commands for PR {api_url=}")
-        return
+        return True
     if not should_process_pr_logic(body): # Here we already updated the configuration with the repo settings
-        return {}
+        return True
     commands = get_settings().get(f"github_app.{commands_conf}")
     if not commands:
         get_logger().info(f"New PR, but no auto commands configured")
-        return
+        return True
     get_settings().set("config.is_auto_command", True)
-    for command in commands:
-        split_command = command.split(" ")
-        command = split_command[0]
-        args = split_command[1:]
-        other_args = update_settings_from_args(args)
-        new_command = ' '.join([command] + other_args)
-        get_logger().info(f"{commands_conf}. Performing auto command '{new_command}', for {api_url=}")
-        await agent.handle_request(api_url, new_command)
+
+    async def perform_commands() -> bool:
+        all_commands_succeeded = True
+        for command in commands:
+            split_command = command.split(" ")
+            command = split_command[0]
+            args = split_command[1:]
+            other_args = update_settings_from_args(args)
+            new_command = ' '.join([command] + other_args)
+            get_logger().info(f"{commands_conf}. Performing auto command '{new_command}', for {api_url=}")
+            command_succeeded = await agent.handle_request(api_url, new_command)
+            if not command_succeeded:
+                all_commands_succeeded = False
+        return all_commands_succeeded
+
+    if not get_settings().github.publish_review_lifecycle:
+        return await perform_commands()
+
+    provider = get_git_provider_with_context(api_url)
+    head_sha = body.get("pull_request", {}).get("head", {}).get("sha")
+    lifecycle = ReviewLifecycle(provider, head_sha)
+    try:
+        lifecycle.create_queued()
+    except Exception as e:
+        get_logger().error("Failed to create review lifecycle", artifact={"error": e}, **log_context)
+        return False
+
+    try:
+        lifecycle.start()
+        timeout_seconds = get_settings().github.review_lifecycle_timeout_seconds
+        async with asyncio.timeout(timeout_seconds):
+            all_commands_succeeded = await perform_commands()
+        if all_commands_succeeded:
+            lifecycle.succeed()
+        else:
+            lifecycle.fail("One or more automatic review commands failed")
+        return all_commands_succeeded
+    except TimeoutError:
+        lifecycle.fail("Automatic review commands timed out")
+        return False
+    except Exception as e:
+        get_logger().error("Automatic review failed", artifact={"error": e}, **log_context)
+        lifecycle.fail("Automatic review failed")
+        return False
 
 
 @router.get("/")
