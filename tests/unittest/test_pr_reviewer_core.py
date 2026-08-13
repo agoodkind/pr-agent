@@ -1,8 +1,12 @@
+from __future__ import annotations
+
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from jinja2 import Environment, StrictUndefined
 
+from pr_agent.algo.review_decision import ReviewEvent
 from pr_agent.config_loader import get_settings
 from pr_agent.tools.pr_reviewer import PRReviewer
 
@@ -20,6 +24,8 @@ def _make_prediction_reviewer(git_provider=None):
     reviewer.remaining_files_list = []
     reviewer.incremental = SimpleNamespace(is_incremental=False)
     reviewer.prediction = None
+    reviewer.publish_review_decision = False
+    reviewer.review_assessment = None
     return reviewer
 
 
@@ -170,6 +176,56 @@ def test_prepare_pr_review_reports_number_of_files_beyond_coverage_limit():
 
     assert "... and 3 more" in review
     assert "- `file_50.py`" not in review
+
+
+def test_prepare_pr_review_keeps_assessment_after_markdown_rendering_mutates_data():
+    reviewer = _make_prediction_reviewer()
+    reviewer.publish_review_decision = True
+    reviewer.remaining_files_list = []
+    reviewer.prediction = "review: {}"
+    review_data = {
+        "review": {
+            "key_issues_to_review": [
+                {
+                    "relevant_file": "src/example.py",
+                    "issue_header": "Possible bug",
+                    "issue_content": "A realistic input triggers the issue.",
+                    "start_line": 10,
+                    "end_line": 12,
+                    "importance": 6,
+                }
+            ]
+        }
+    }
+    reviewer.git_provider.get_diff_files.return_value = []
+    reviewer.git_provider.is_supported.return_value = False
+    reviewer.set_review_labels = MagicMock()
+
+    def render_and_mutate(data, *args, **kwargs):
+        data["review"].clear()
+        return "original review"
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.load_yaml", return_value=review_data),
+        patch("pr_agent.tools.pr_reviewer.github_action_output"),
+        patch("pr_agent.tools.pr_reviewer.convert_to_markdown_v2", side_effect=render_and_mutate),
+    ):
+        review = reviewer._prepare_pr_review()
+
+    assert review == "original review"
+    assert reviewer.review_assessment is not None
+    assert reviewer.review_assessment.event is ReviewEvent.COMMENT
+    assert reviewer.review_assessment.findings[0].importance == 6
+
+
+def test_prepare_pr_review_disabled_mode_keeps_current_guide_without_assessment():
+    reviewer = _make_prediction_reviewer()
+    reviewer.publish_review_decision = False
+
+    review = _render_review(reviewer, [])
+
+    assert review == "original review"
+    assert reviewer.review_assessment is None
 
 
 def test_should_publish_review_no_suggestions_respects_config():
@@ -346,6 +402,39 @@ def test_init_maps_user_question_and_answer_to_correct_prompt_vars(monkeypatch):
 
     assert reviewer.vars["question_str"] == "Questions to better understand the PR:\n- Why?"
     assert reviewer.vars["answer_str"] == "/answer Because it fixes production."
+
+
+@pytest.mark.parametrize(
+    ("publish_review_decision", "expects_importance"),
+    [(True, True), (False, False)],
+)
+def test_review_decision_prompt_includes_importance_only_when_enabled(
+    monkeypatch,
+    publish_review_decision,
+    expects_importance,
+):
+    from pr_agent.tools import pr_reviewer as pr_reviewer_module
+
+    provider = MagicMock()
+    provider.is_supported.return_value = True
+    provider.get_languages.return_value = {}
+    provider.get_files.return_value = []
+    provider.get_pr_description.return_value = ("desc", [])
+
+    monkeypatch.setattr(pr_reviewer_module, "get_git_provider_with_context", lambda pr_url: provider)
+    monkeypatch.setattr(pr_reviewer_module, "get_main_pr_language", lambda languages, files: "Python")
+    monkeypatch.setattr(pr_reviewer_module, "TokenHandler", MagicMock())
+
+    reviewer = PRReviewer(
+        "https://example/pr/1",
+        publish_review_decision=publish_review_decision,
+        ai_handler=lambda: SimpleNamespace(main_pr_language=None),
+    )
+    prompt = Environment(undefined=StrictUndefined).from_string(
+        get_settings().pr_review_prompt.system
+    ).render(reviewer.vars)
+
+    assert ("importance: int" in prompt) is expects_importance
 
 
 def _build_answer_mode_reviewer(monkeypatch, issue_comments):

@@ -1,9 +1,12 @@
+from __future__ import annotations
+
 import copy
 import datetime
 from functools import partial
 from typing import List, Tuple
 
 from jinja2 import Environment, StrictUndefined
+from pydantic import ValidationError
 
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
@@ -11,6 +14,7 @@ from pr_agent.algo.pr_processing import (add_ai_metadata_to_diff_files,
                                          get_pr_diff,
                                          retry_with_fallback_models)
 from pr_agent.algo.repo_context import build_repo_context
+from pr_agent.algo.review_decision import ReviewAssessment, ReviewFinding, assess_review
 from pr_agent.algo.run_details import init_run_details
 from pr_agent.algo.skills_loader import get_skills_context
 from pr_agent.algo.token_handler import TokenHandler
@@ -36,6 +40,7 @@ class PRReviewer:
     """
 
     def __init__(self, pr_url: str, is_answer: bool = False, is_auto: bool = False, args: list = None,
+                 publish_review_decision: bool = False,
                  ai_handler: partial[BaseAiHandler,] = LiteLLMAIHandler):
         """
         Initialize the PRReviewer object with the necessary attributes and objects to review a pull request.
@@ -44,6 +49,7 @@ class PRReviewer:
             pr_url (str): The URL of the pull request to be reviewed.
             is_answer (bool, optional): Indicates whether the review is being done in answer mode. Defaults to False.
             is_auto (bool, optional): Indicates whether the review is being done in automatic mode. Defaults to False.
+            publish_review_decision (bool, optional): Enables decision assessment for this request. Defaults to False.
             ai_handler (BaseAiHandler): The AI handler to be used for the review. Defaults to None.
             args (list, optional): List of arguments passed to the PRReviewer class. Defaults to None.
         """
@@ -59,6 +65,8 @@ class PRReviewer:
         self.pr_url = pr_url
         self.is_answer = is_answer
         self.is_auto = is_auto
+        self.publish_review_decision = publish_review_decision
+        self.review_assessment: ReviewAssessment | None = None
 
         if self.is_answer and not self.git_provider.is_supported("get_issue_comments"):
             raise Exception(f"Answer mode is not supported for {get_settings().config.git_provider} for now")
@@ -104,6 +112,7 @@ class PRReviewer:
             "is_ai_metadata":  get_settings().get("config.enable_ai_metadata", False),
             "related_tickets": get_settings().get('related_tickets', []),
             'duplicate_prompt_examples': get_settings().config.get('duplicate_prompt_examples', False),
+            "publish_review_decision": self.publish_review_decision,
             "date": datetime.datetime.now().strftime('%Y-%m-%d'),
         }
 
@@ -269,6 +278,24 @@ class PRReviewer:
             get_logger().exception("Failed to parse review data", artifact={"data": data})
             return ""
 
+        if getattr(self, "publish_review_decision", False):
+            key_issues_to_review = data["review"].get("key_issues_to_review", [])
+            try:
+                findings = [ReviewFinding.model_validate(finding) for finding in key_issues_to_review]
+                self.review_assessment = assess_review(
+                    findings,
+                    self.remaining_files_list,
+                    get_settings().github.review_decision_min_importance,
+                )
+            except ValidationError:
+                get_logger().exception("Failed to parse review findings", artifact={"data": key_issues_to_review})
+                self.review_assessment = ReviewAssessment(
+                    event="COMMENT",
+                    body="",
+                    findings=[],
+                    full_coverage=not self.remaining_files_list,
+                )
+
         # move data['review'] 'key_issues_to_review' key to the end of the dictionary
         if 'key_issues_to_review' in data['review']:
             key_issues_to_review = data['review'].pop('key_issues_to_review')
@@ -285,6 +312,10 @@ class PRReviewer:
                                             incremental_review_markdown_text,
                                                git_provider=self.git_provider,
                                                files=self.git_provider.get_diff_files())
+
+        review_assessment = getattr(self, "review_assessment", None)
+        if review_assessment is not None:
+            review_assessment.body = markdown_text
 
         if self.remaining_files_list and get_settings().pr_reviewer.enable_review_coverage_footer:
             displayed_files = self.remaining_files_list[:MAX_REVIEW_COVERAGE_FILES]
