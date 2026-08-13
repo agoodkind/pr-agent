@@ -8,7 +8,7 @@ import re
 import time
 import traceback
 from datetime import datetime
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
 from github.Issue import Issue
@@ -22,6 +22,7 @@ from ..algo.inline_comment_dedup import (body_fingerprint, body_with_markers,
                                          code_fingerprint,
                                          get_inline_comment_store, has_marker)
 from ..algo.language_handler import is_valid_file
+from ..algo.review_decision import ReviewAssessment, ReviewFinding
 from ..algo.types import EDIT_TYPE
 from ..algo.utils import (PRReviewHeader, Range, clip_tokens,
                           find_line_number_of_relevant_line_in_file,
@@ -31,6 +32,10 @@ from ..log import get_logger
 from ..servers.utils import RateLimitExceeded
 from .git_provider import (MAX_FILES_ALLOWED_FULL, FilePatchInfo, GitProvider,
                            IncrementalPR, get_cached_global_settings)
+
+
+REVIEW_DECISION_POLICY_VERSION = 1
+RIGHT_HUNK_HEADER = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 
 
 def _next_page_url(headers: dict) -> str:
@@ -513,6 +518,111 @@ class GithubProvider(GitProvider):
             subject_type = "LINE"
         path = relevant_file.strip()
         return dict(body=body, path=path, position=position) if subject_type == "LINE" else {}
+
+    def can_publish_review_decision(self, sender_login: str) -> bool:
+        if sender_login == self.pr.user.login:
+            return True
+        try:
+            return self._get_repo().has_in_collaborators(sender_login)
+        except Exception as e:
+            get_logger().warning(
+                "Failed to verify GitHub review-decision collaborator",
+                artifact={"sender_login": sender_login, "error": e},
+            )
+            return False
+
+    def _review_decision_marker(self, analyzed_head_sha: str) -> str:
+        return (
+            "<!-- pr-agent-review-decision:"
+            f"sha={analyzed_head_sha};policy={REVIEW_DECISION_POLICY_VERSION} -->"
+        )
+
+    def _right_side_changed_lines(self) -> dict[str, set[int]]:
+        changed_lines_by_file: dict[str, set[int]] = {}
+        for diff_file in self.get_diff_files():
+            changed_lines: set[int] = set()
+            current_right_line: int | None = None
+            for patch_line in (diff_file.patch or "").splitlines():
+                hunk_header = RIGHT_HUNK_HEADER.match(patch_line)
+                if hunk_header:
+                    current_right_line = int(hunk_header.group(1))
+                    continue
+                if current_right_line is None:
+                    continue
+                if patch_line.startswith("+") and not patch_line.startswith("+++"):
+                    changed_lines.add(current_right_line)
+                    current_right_line += 1
+                    continue
+                if patch_line.startswith("-") and not patch_line.startswith("---"):
+                    continue
+                if patch_line.startswith(" "):
+                    current_right_line += 1
+            changed_lines_by_file[diff_file.filename] = changed_lines
+        return changed_lines_by_file
+
+    def _review_finding_body(self, finding: ReviewFinding) -> str:
+        body_parts = [f"**{finding.issue_header}**", finding.issue_content]
+        if type(finding.importance) is int and 1 <= finding.importance <= 10:
+            body_parts.append(f"Importance: {finding.importance}")
+        body = "\n\n".join(body_parts)
+        return self.limit_output_characters(body, self.max_comment_chars)
+
+    def _review_findings_to_inline_comments(
+        self,
+        findings: Sequence[ReviewFinding],
+    ) -> list[dict]:
+        changed_lines_by_file = self._right_side_changed_lines()
+        inline_comments = []
+        for finding in findings:
+            changed_lines = changed_lines_by_file.get(finding.relevant_file, set())
+            if finding.start_line <= 0 or finding.end_line < finding.start_line:
+                continue
+            expected_lines = set(range(finding.start_line, finding.end_line + 1))
+            if not expected_lines.issubset(changed_lines):
+                continue
+            comment = {
+                "body": self._review_finding_body(finding),
+                "path": finding.relevant_file,
+                "line": finding.end_line,
+                "side": "RIGHT",
+            }
+            if finding.start_line != finding.end_line:
+                comment["start_line"] = finding.start_line
+                comment["start_side"] = "RIGHT"
+            inline_comments.append(comment)
+        return inline_comments
+
+    def _has_review_decision_for_head(self, analyzed_head_sha: str) -> bool:
+        marker = self._review_decision_marker(analyzed_head_sha)
+        for review in self.pr.get_reviews():
+            if marker in (getattr(review, "body", "") or ""):
+                return True
+        return False
+
+    def publish_review_decision(
+        self,
+        assessment: ReviewAssessment,
+        analyzed_head_sha: str,
+    ) -> None:
+        self.pr = self._get_pr()
+        if self.pr.head.sha != analyzed_head_sha:
+            raise ValueError("Pull request head changed before review publication")
+        if self._has_review_decision_for_head(analyzed_head_sha):
+            get_logger().info(
+                "GitHub review decision already exists for the analyzed pull request head"
+            )
+            return
+        review_body = "\n\n".join(
+            [assessment.body, self._review_decision_marker(analyzed_head_sha)]
+        )
+        reviewed_commit = self._get_repo().get_commit(analyzed_head_sha)
+        inline_comments = self._review_findings_to_inline_comments(assessment.findings)
+        self.pr.create_review(
+            commit=reviewed_commit,
+            event=assessment.event.value,
+            body=review_body,
+            comments=inline_comments,
+        )
 
     def publish_inline_comments(self, comments: list[dict], disable_fallback: bool = False):
         store = None
