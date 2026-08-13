@@ -65,7 +65,9 @@ class PRReviewer:
         self.pr_url = pr_url
         self.is_answer = is_answer
         self.is_auto = is_auto
-        self.publish_review_decision = publish_review_decision
+        self.publish_review_decision = (
+            publish_review_decision and get_settings().github.publish_review_decision
+        )
         self.review_assessment: ReviewAssessment | None = None
 
         if self.is_answer and not self.git_provider.is_supported("get_issue_comments"):
@@ -134,10 +136,7 @@ class PRReviewer:
 
     async def run(self) -> None:
         init_run_details()
-        should_publish_review_decision = (
-            getattr(self, "publish_review_decision", False)
-            and get_settings().github.publish_review_decision
-        )
+        should_publish_review_decision = self._review_decision_enabled()
         analyzed_head_sha = None
         if should_publish_review_decision:
             analyzed_head_sha = self.git_provider.pr.head.sha
@@ -197,6 +196,11 @@ class PRReviewer:
                     reason += ": no major issues detected."
                 get_logger().info(reason)
                 get_settings().data = {"artifact": pr_review}
+                if should_publish_review_decision:
+                    self.git_provider.publish_review_decision(
+                        self.review_assessment,
+                        analyzed_head_sha,
+                    )
                 return
 
             # publish the review
@@ -230,6 +234,12 @@ class PRReviewer:
 
     def _should_publish_review_no_suggestions(self, pr_review: str) -> bool:
         return get_settings().pr_reviewer.get('publish_output_no_suggestions', True) or "No major issues detected" not in pr_review
+
+    def _review_decision_enabled(self) -> bool:
+        return bool(
+            getattr(self, "publish_review_decision", False)
+            and get_settings().github.publish_review_decision
+        )
 
     async def _prepare_prediction(self, model: str) -> None:
         output = get_pr_diff(self.git_provider,
@@ -294,7 +304,7 @@ class PRReviewer:
             get_logger().exception("Failed to parse review data", artifact={"data": data})
             return ""
 
-        if getattr(self, "publish_review_decision", False):
+        if self._review_decision_enabled():
             key_issues_to_review = data["review"].get("key_issues_to_review", [])
             findings = []
             has_invalid_findings = False
