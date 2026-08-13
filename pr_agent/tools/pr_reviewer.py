@@ -1,9 +1,12 @@
+from __future__ import annotations
+
 import copy
 import datetime
 from functools import partial
 from typing import List, Tuple
 
 from jinja2 import Environment, StrictUndefined
+from pydantic import ValidationError
 
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
@@ -11,6 +14,7 @@ from pr_agent.algo.pr_processing import (add_ai_metadata_to_diff_files,
                                          get_pr_diff,
                                          retry_with_fallback_models)
 from pr_agent.algo.repo_context import build_repo_context
+from pr_agent.algo.review_decision import ReviewAssessment, ReviewFinding, assess_review
 from pr_agent.algo.run_details import init_run_details
 from pr_agent.algo.skills_loader import get_skills_context
 from pr_agent.algo.token_handler import TokenHandler
@@ -36,6 +40,7 @@ class PRReviewer:
     """
 
     def __init__(self, pr_url: str, is_answer: bool = False, is_auto: bool = False, args: list = None,
+                 publish_review_decision: bool = False,
                  ai_handler: partial[BaseAiHandler,] = LiteLLMAIHandler):
         """
         Initialize the PRReviewer object with the necessary attributes and objects to review a pull request.
@@ -44,6 +49,7 @@ class PRReviewer:
             pr_url (str): The URL of the pull request to be reviewed.
             is_answer (bool, optional): Indicates whether the review is being done in answer mode. Defaults to False.
             is_auto (bool, optional): Indicates whether the review is being done in automatic mode. Defaults to False.
+            publish_review_decision (bool, optional): Enables decision assessment for this request. Defaults to False.
             ai_handler (BaseAiHandler): The AI handler to be used for the review. Defaults to None.
             args (list, optional): List of arguments passed to the PRReviewer class. Defaults to None.
         """
@@ -59,6 +65,10 @@ class PRReviewer:
         self.pr_url = pr_url
         self.is_answer = is_answer
         self.is_auto = is_auto
+        self.publish_review_decision = (
+            publish_review_decision and get_settings().github.publish_review_decision
+        )
+        self.review_assessment: ReviewAssessment | None = None
 
         if self.is_answer and not self.git_provider.is_supported("get_issue_comments"):
             raise Exception(f"Answer mode is not supported for {get_settings().config.git_provider} for now")
@@ -104,6 +114,7 @@ class PRReviewer:
             "is_ai_metadata":  get_settings().get("config.enable_ai_metadata", False),
             "related_tickets": get_settings().get('related_tickets', []),
             'duplicate_prompt_examples': get_settings().config.get('duplicate_prompt_examples', False),
+            "publish_review_decision": self.publish_review_decision,
             "date": datetime.datetime.now().strftime('%Y-%m-%d'),
         }
 
@@ -125,6 +136,10 @@ class PRReviewer:
 
     async def run(self) -> None:
         init_run_details()
+        should_publish_review_decision = self._review_decision_enabled()
+        analyzed_head_sha = None
+        if should_publish_review_decision:
+            analyzed_head_sha = self.git_provider.pr.head.sha
         try:
             if not self.git_provider.get_files():
                 get_logger().info(f"PR has no files: {self.pr_url}, skipping review")
@@ -181,6 +196,24 @@ class PRReviewer:
                     reason += ": no major issues detected."
                 get_logger().info(reason)
                 get_settings().data = {"artifact": pr_review}
+                if get_settings().config.publish_output:
+                    review_thread_kwargs = {"as_thread": True} if self.git_provider.should_publish_review_as_thread() else {}
+                    if get_settings().pr_reviewer.persistent_comment and not self.incremental.is_incremental:
+                        final_update_message = get_settings().pr_reviewer.final_update_message
+                        self.git_provider.publish_persistent_comment(
+                            pr_review,
+                            initial_header=f"{PRReviewHeader.REGULAR.value} 🔍",
+                            update_header=True,
+                            final_update_message=final_update_message,
+                            **review_thread_kwargs,
+                        )
+                    else:
+                        self.git_provider.publish_comment(pr_review, **review_thread_kwargs)
+                if should_publish_review_decision:
+                    self.git_provider.publish_review_decision(
+                        self.review_assessment,
+                        analyzed_head_sha,
+                    )
                 return
 
             # publish the review
@@ -197,14 +230,29 @@ class PRReviewer:
             else:
                 self.git_provider.publish_comment(pr_review, **review_thread_kwargs)
 
+            if should_publish_review_decision:
+                self.git_provider.publish_review_decision(
+                    self.review_assessment,
+                    analyzed_head_sha,
+                )
+
             self.git_provider.remove_initial_comment()
         except Exception as e:
             get_logger().error(f"Failed to review PR: {e}")
-            if get_settings().config.get("propagate_tool_errors", False):
+            if (
+                should_publish_review_decision
+                or get_settings().config.get("propagate_tool_errors", False)
+            ):
                 raise
 
     def _should_publish_review_no_suggestions(self, pr_review: str) -> bool:
         return get_settings().pr_reviewer.get('publish_output_no_suggestions', True) or "No major issues detected" not in pr_review
+
+    def _review_decision_enabled(self) -> bool:
+        return bool(
+            getattr(self, "publish_review_decision", False)
+            and get_settings().github.publish_review_decision
+        )
 
     async def _prepare_prediction(self, model: str) -> None:
         output = get_pr_diff(self.git_provider,
@@ -269,6 +317,23 @@ class PRReviewer:
             get_logger().exception("Failed to parse review data", artifact={"data": data})
             return ""
 
+        if self._review_decision_enabled():
+            key_issues_to_review = data["review"].get("key_issues_to_review", [])
+            findings = []
+            has_invalid_findings = False
+            for finding in key_issues_to_review:
+                try:
+                    findings.append(ReviewFinding.model_validate(finding))
+                except ValidationError:
+                    get_logger().exception("Failed to parse review finding", artifact={"data": finding})
+                    has_invalid_findings = True
+            self.review_assessment = assess_review(
+                findings,
+                self.remaining_files_list,
+                get_settings().github.review_decision_min_importance,
+                has_invalid_findings=has_invalid_findings,
+            )
+
         # move data['review'] 'key_issues_to_review' key to the end of the dictionary
         if 'key_issues_to_review' in data['review']:
             key_issues_to_review = data['review'].pop('key_issues_to_review')
@@ -317,6 +382,10 @@ class PRReviewer:
 
         if markdown_text == None or len(markdown_text) == 0:
             markdown_text = ""
+
+        review_assessment = getattr(self, "review_assessment", None)
+        if review_assessment is not None:
+            review_assessment.body = markdown_text
 
         return markdown_text
 
