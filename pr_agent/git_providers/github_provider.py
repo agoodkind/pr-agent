@@ -583,15 +583,17 @@ class GithubProvider(GitProvider):
             if finding.start_line <= 0 or finding.end_line < finding.start_line:
                 continue
             expected_lines = set(range(finding.start_line, finding.end_line + 1))
-            if not expected_lines.issubset(changed_lines):
+            matching_lines = expected_lines.intersection(changed_lines)
+            if not matching_lines:
                 continue
+            end_line = max(matching_lines)
             comment = {
                 "body": self._review_finding_body(finding),
                 "path": finding.relevant_file,
-                "line": finding.end_line,
+                "line": end_line,
                 "side": "RIGHT",
             }
-            if finding.start_line != finding.end_line:
+            if expected_lines.issubset(changed_lines) and finding.start_line != finding.end_line:
                 comment["start_line"] = finding.start_line
                 comment["start_side"] = "RIGHT"
             inline_comments.append(comment)
