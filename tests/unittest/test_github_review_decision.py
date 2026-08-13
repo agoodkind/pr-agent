@@ -14,14 +14,16 @@ from pr_agent.git_providers.github_provider import GithubProvider
 
 
 class FakeRepository:
-    def __init__(self, collaborators: set[str] | None = None) -> None:
-        self.collaborators = collaborators or set()
+    def __init__(self, collaborators: dict[str, str] | None = None) -> None:
+        self.collaborators = collaborators or {}
 
     def get_commit(self, sha: str) -> SimpleNamespace:
         return SimpleNamespace(sha=sha)
 
-    def has_in_collaborators(self, login: str) -> bool:
-        return login in self.collaborators
+    def get_collaborator_permission(self, login: str) -> str:
+        if login not in self.collaborators:
+            raise KeyError(login)
+        return self.collaborators[login]
 
 
 class FakePullRequest:
@@ -79,7 +81,7 @@ def make_provider(
     head_sha: str = "analyzed-head",
     review_bodies: list[str] | None = None,
     reviewer_login: str = "pr-agent[bot]",
-    collaborators: set[str] | None = None,
+    collaborators: dict[str, str] | None = None,
 ) -> tuple[GithubProvider, FakePullRequest]:
     pull_request = FakePullRequest(head_sha, review_bodies, reviewer_login)
     provider = GithubProvider.__new__(GithubProvider)
@@ -184,9 +186,11 @@ def test_publish_review_decision_rejects_a_stale_head_before_creating_review() -
 @pytest.mark.parametrize(
     ("sender_login", "collaborators", "expected"),
     [
-        ("pull-author", set(), True),
-        ("repository-collaborator", {"repository-collaborator"}, True),
-        ("other-user", set(), False),
+        ("pull-author", {}, True),
+        ("write-collaborator", {"write-collaborator": "write"}, True),
+        ("admin-collaborator", {"admin-collaborator": "admin"}, True),
+        ("read-collaborator", {"read-collaborator": "read"}, False),
+        ("other-user", {}, False),
     ],
 )
 def test_can_publish_review_decision_requires_author_or_collaborator(

@@ -523,7 +523,12 @@ class GithubProvider(GitProvider):
         if sender_login == self.pr.user.login:
             return True
         try:
-            return self._get_repo().has_in_collaborators(sender_login)
+            permission = self._get_repo().get_collaborator_permission(sender_login)
+            if isinstance(permission, dict):
+                permission = permission.get("permission")
+            else:
+                permission = getattr(permission, "permission", permission)
+            return permission in {"write", "admin"}
         except Exception as e:
             get_logger().warning(
                 "Failed to verify GitHub review-decision collaborator",
