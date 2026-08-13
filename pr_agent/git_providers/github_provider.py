@@ -579,7 +579,8 @@ class GithubProvider(GitProvider):
         changed_lines_by_file = self._right_side_changed_lines()
         inline_comments = []
         for finding in findings:
-            changed_lines = changed_lines_by_file.get(finding.relevant_file, set())
+            relevant_file = finding.relevant_file.strip()
+            changed_lines = changed_lines_by_file.get(relevant_file, set())
             if finding.start_line <= 0 or finding.end_line < finding.start_line:
                 continue
             expected_lines = set(range(finding.start_line, finding.end_line + 1))
@@ -589,7 +590,7 @@ class GithubProvider(GitProvider):
             end_line = max(matching_lines)
             comment = {
                 "body": self._review_finding_body(finding),
-                "path": finding.relevant_file,
+                "path": relevant_file,
                 "line": end_line,
                 "side": "RIGHT",
             }
