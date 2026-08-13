@@ -218,6 +218,120 @@ def test_prepare_pr_review_keeps_assessment_after_markdown_rendering_mutates_dat
     assert reviewer.review_assessment.findings[0].importance == 6
 
 
+@pytest.mark.parametrize(
+    ("key_issues_to_review", "expected_event"),
+    [
+        (
+            [
+                {
+                    "relevant_file": "src/critical.py",
+                    "issue_header": "Data loss",
+                    "issue_content": "A valid request deletes stored data.",
+                    "start_line": 10,
+                    "end_line": 12,
+                    "importance": 7,
+                },
+                {
+                    "relevant_file": "src/secondary.py",
+                    "issue_header": "Malformed importance",
+                    "issue_content": "The model returned text instead of an integer.",
+                    "start_line": 20,
+                    "end_line": 22,
+                    "importance": "high",
+                },
+            ],
+            ReviewEvent.REQUEST_CHANGES,
+        ),
+        (
+            [
+                {
+                    "relevant_file": "src/secondary.py",
+                    "issue_header": "Malformed importance",
+                    "issue_content": "The model returned text instead of an integer.",
+                    "start_line": 20,
+                    "end_line": 22,
+                    "importance": "high",
+                },
+            ],
+            ReviewEvent.COMMENT,
+        ),
+    ],
+)
+def test_prepare_pr_review_keeps_malformed_findings_in_decision_policy(
+    key_issues_to_review, expected_event
+):
+    reviewer = _make_prediction_reviewer()
+    reviewer.publish_review_decision = True
+    reviewer.prediction = "review: {}"
+    reviewer.git_provider.get_diff_files.return_value = []
+    reviewer.git_provider.is_supported.return_value = False
+    reviewer.set_review_labels = MagicMock()
+
+    with (
+        patch(
+            "pr_agent.tools.pr_reviewer.load_yaml",
+            return_value={"review": {"key_issues_to_review": key_issues_to_review}},
+        ),
+        patch("pr_agent.tools.pr_reviewer.github_action_output"),
+        patch("pr_agent.tools.pr_reviewer.convert_to_markdown_v2", return_value="original review"),
+    ):
+        reviewer._prepare_pr_review()
+
+    assert reviewer.review_assessment is not None
+    assert reviewer.review_assessment.event is expected_event
+    assert reviewer.review_assessment.has_invalid_findings is True
+
+
+def test_prepare_pr_review_assigns_the_complete_published_body_to_assessment():
+    reviewer = _make_prediction_reviewer()
+    reviewer.publish_review_decision = True
+    reviewer.prediction = "review: {}"
+    reviewer.remaining_files_list = ["skipped.py"]
+    reviewer.git_provider.get_diff_files.return_value = []
+    reviewer.git_provider.is_supported.return_value = True
+    reviewer.set_review_labels = MagicMock()
+    settings = get_settings()
+    original = {
+        "enable_review_coverage_footer": settings.pr_reviewer.enable_review_coverage_footer,
+        "enable_help_text": settings.pr_reviewer.enable_help_text,
+        "output_relevant_configurations": settings.config.output_relevant_configurations,
+        "output_run_details": settings.config.output_run_details,
+    }
+
+    try:
+        settings.pr_reviewer.enable_review_coverage_footer = True
+        settings.pr_reviewer.enable_help_text = True
+        settings.config.output_relevant_configurations = True
+        settings.config.output_run_details = True
+        with (
+            patch(
+                "pr_agent.tools.pr_reviewer.load_yaml",
+                return_value={"review": {"key_issues_to_review": []}},
+            ),
+            patch("pr_agent.tools.pr_reviewer.github_action_output"),
+            patch("pr_agent.tools.pr_reviewer.convert_to_markdown_v2", return_value="original review"),
+            patch("pr_agent.tools.pr_reviewer.HelpMessage.get_review_usage_guide", return_value="help text"),
+            patch("pr_agent.tools.pr_reviewer.show_relevant_configurations", return_value="config text"),
+            patch("pr_agent.tools.pr_reviewer.show_run_details", return_value="run details"),
+        ):
+            review = reviewer._prepare_pr_review()
+    finally:
+        settings.pr_reviewer.enable_review_coverage_footer = original["enable_review_coverage_footer"]
+        settings.pr_reviewer.enable_help_text = original["enable_help_text"]
+        settings.config.output_relevant_configurations = original["output_relevant_configurations"]
+        settings.config.output_run_details = original["output_run_details"]
+
+    assert reviewer.review_assessment is not None
+    assert reviewer.review_assessment.body == review
+    assert review == (
+        "original review\n\n<hr>\n\n"
+        "⚠️ **Review coverage:** The following files were not included in this review "
+        "because of the token budget:\n"
+        "- `skipped.py`<hr>\n\n<details> <summary><strong>💡 Tool usage guide:"
+        "</strong></summary><hr> \n\nhelp text\n</details>\nconfig textrun details"
+    )
+
+
 def test_prepare_pr_review_disabled_mode_keeps_current_guide_without_assessment():
     reviewer = _make_prediction_reviewer()
     reviewer.publish_review_decision = False

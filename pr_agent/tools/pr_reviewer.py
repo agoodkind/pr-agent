@@ -280,21 +280,20 @@ class PRReviewer:
 
         if getattr(self, "publish_review_decision", False):
             key_issues_to_review = data["review"].get("key_issues_to_review", [])
-            try:
-                findings = [ReviewFinding.model_validate(finding) for finding in key_issues_to_review]
-                self.review_assessment = assess_review(
-                    findings,
-                    self.remaining_files_list,
-                    get_settings().github.review_decision_min_importance,
-                )
-            except ValidationError:
-                get_logger().exception("Failed to parse review findings", artifact={"data": key_issues_to_review})
-                self.review_assessment = ReviewAssessment(
-                    event="COMMENT",
-                    body="",
-                    findings=[],
-                    full_coverage=not self.remaining_files_list,
-                )
+            findings = []
+            has_invalid_findings = False
+            for finding in key_issues_to_review:
+                try:
+                    findings.append(ReviewFinding.model_validate(finding))
+                except ValidationError:
+                    get_logger().exception("Failed to parse review finding", artifact={"data": finding})
+                    has_invalid_findings = True
+            self.review_assessment = assess_review(
+                findings,
+                self.remaining_files_list,
+                get_settings().github.review_decision_min_importance,
+                has_invalid_findings=has_invalid_findings,
+            )
 
         # move data['review'] 'key_issues_to_review' key to the end of the dictionary
         if 'key_issues_to_review' in data['review']:
@@ -312,10 +311,6 @@ class PRReviewer:
                                             incremental_review_markdown_text,
                                                git_provider=self.git_provider,
                                                files=self.git_provider.get_diff_files())
-
-        review_assessment = getattr(self, "review_assessment", None)
-        if review_assessment is not None:
-            review_assessment.body = markdown_text
 
         if self.remaining_files_list and get_settings().pr_reviewer.enable_review_coverage_footer:
             displayed_files = self.remaining_files_list[:MAX_REVIEW_COVERAGE_FILES]
@@ -348,6 +343,10 @@ class PRReviewer:
 
         if markdown_text == None or len(markdown_text) == 0:
             markdown_text = ""
+
+        review_assessment = getattr(self, "review_assessment", None)
+        if review_assessment is not None:
+            review_assessment.body = markdown_text
 
         return markdown_text
 

@@ -32,12 +32,14 @@ class ReviewAssessment(BaseModel):
     body: str
     findings: list[ReviewFinding]
     full_coverage: bool
+    has_invalid_findings: bool
 
 
 def assess_review(
     findings: list[ReviewFinding],
     remaining_files: list[str],
     minimum_importance: int,
+    has_invalid_findings: bool = False,
 ) -> ReviewAssessment:
     full_coverage = not remaining_files
     has_invalid_importance = False
@@ -53,14 +55,16 @@ def assess_review(
                 body="",
                 findings=findings,
                 full_coverage=full_coverage,
+                has_invalid_findings=has_invalid_findings or has_invalid_importance,
             )
 
-    if findings or not full_coverage or has_invalid_importance:
+    if findings or not full_coverage or has_invalid_findings or has_invalid_importance:
         return ReviewAssessment(
             event=ReviewEvent.COMMENT,
             body="",
             findings=findings,
             full_coverage=full_coverage,
+            has_invalid_findings=has_invalid_findings or has_invalid_importance,
         )
 
     return ReviewAssessment(
@@ -68,4 +72,5 @@ def assess_review(
         body="",
         findings=findings,
         full_coverage=True,
+        has_invalid_findings=False,
     )
