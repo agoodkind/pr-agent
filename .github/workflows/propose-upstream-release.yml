@@ -55,9 +55,20 @@ jobs:
           [[ $(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${lifecycle_tag_sha}" \
             --jq '.verification.verified') == "true" ]]
 
+          decisions_ref=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/git/ref/tags/fork/review-decisions-v1")
+          decisions_type=$(jq -r '.object.type' <<< "$decisions_ref")
+          decisions_tag_sha=$(jq -r '.object.sha' <<< "$decisions_ref")
+          [[ "$decisions_type" == "tag" ]]
+          [[ $(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${decisions_tag_sha}" \
+            --jq '.verification.verified') == "true" ]]
+
           git fetch --no-tags origin \
             refs/tags/fork/lifecycle-v1:refs/tags/fork/lifecycle-v1
           [[ $(git rev-parse 'refs/tags/fork/lifecycle-v1^{tag}') == "$lifecycle_tag_sha" ]]
+          git fetch --no-tags origin \
+            refs/tags/fork/review-decisions-v1:refs/tags/fork/review-decisions-v1
+          [[ $(git rev-parse 'refs/tags/fork/review-decisions-v1^{tag}') == "$decisions_tag_sha" ]]
 
           git switch --detach "${upstream_ref}^{commit}"
           git config user.name "github-actions[bot]"
@@ -66,11 +77,20 @@ jobs:
           GIT_COMMITTER_DATE=$(git show -s --format=%aI 'fork/lifecycle-v1^{commit}')
 
           if ! git cherry-pick fork/lifecycle-v1; then
+            git cherry-pick --abort >/dev/null 2>&1 || true
             printf 'The lifecycle patch conflicts with upstream release %s.\n' "$release_tag" >&2
             git status --short
             exit 1
           fi
-          [[ $(git rev-list --count "${upstream_ref}^{commit}..HEAD") -eq 1 ]]
+          GIT_COMMITTER_DATE=$(git show -s --format=%aI 'fork/review-decisions-v1^{commit}')
+          export GIT_COMMITTER_DATE
+          if ! git cherry-pick fork/review-decisions-v1; then
+            git cherry-pick --abort >/dev/null 2>&1 || true
+            printf 'The review-decisions patch conflicts with upstream release %s.\n' "$release_tag" >&2
+            git status --short
+            exit 1
+          fi
+          [[ $(git rev-list --count "${upstream_ref}^{commit}..HEAD") -eq 2 ]]
           prepared_sha=$(git rev-parse HEAD)
           git bundle create "$RUNNER_TEMP/prepared.bundle" HEAD
 
@@ -174,9 +194,19 @@ jobs:
           [[ "$lifecycle_type" == "tag" ]]
           [[ $(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${lifecycle_tag_sha}" \
             --jq '.verification.verified') == "true" ]]
+          decisions_ref=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/git/ref/tags/fork/review-decisions-v1")
+          decisions_type=$(jq -r '.object.type' <<< "$decisions_ref")
+          decisions_tag_sha=$(jq -r '.object.sha' <<< "$decisions_ref")
+          [[ "$decisions_type" == "tag" ]]
+          [[ $(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${decisions_tag_sha}" \
+            --jq '.verification.verified') == "true" ]]
           git fetch --no-tags "https://github.com/${GITHUB_REPOSITORY}.git" \
             refs/tags/fork/lifecycle-v1:refs/tags/fork/lifecycle-v1
           [[ $(git rev-parse 'refs/tags/fork/lifecycle-v1^{tag}') == "$lifecycle_tag_sha" ]]
+          git fetch --no-tags "https://github.com/${GITHUB_REPOSITORY}.git" \
+            refs/tags/fork/review-decisions-v1:refs/tags/fork/review-decisions-v1
+          [[ $(git rev-parse 'refs/tags/fork/review-decisions-v1^{tag}') == "$decisions_tag_sha" ]]
 
           git switch --detach "${upstream_ref}^{commit}"
           git config user.name "github-actions[bot]"
@@ -184,6 +214,9 @@ jobs:
           export GIT_COMMITTER_DATE
           GIT_COMMITTER_DATE=$(git show -s --format=%aI 'fork/lifecycle-v1^{commit}')
           git cherry-pick fork/lifecycle-v1
+          GIT_COMMITTER_DATE=$(git show -s --format=%aI 'fork/review-decisions-v1^{commit}')
+          export GIT_COMMITTER_DATE
+          git cherry-pick fork/review-decisions-v1
           [[ $(git rev-parse HEAD) == "$PREPARED_SHA" ]]
 
           branch="automation/upstream-${release_tag#v}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
@@ -203,5 +236,5 @@ jobs:
 
           gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$BRANCH" \
             --title "Update fork to upstream ${RELEASE_TAG}" \
-            --body "Apply the signed fork lifecycle patch to upstream ${RELEASE_TAG}."
+            --body "Apply the signed fork lifecycle and review-decisions patches to upstream ${RELEASE_TAG}."
           gh workflow run fork-check.yml --repo "$GITHUB_REPOSITORY" --ref "$BRANCH"
