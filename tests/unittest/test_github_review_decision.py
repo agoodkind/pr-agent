@@ -29,11 +29,15 @@ class FakePullRequest:
         self,
         head_sha: str,
         review_bodies: list[str] | None = None,
+        reviewer_login: str = "pr-agent[bot]",
     ) -> None:
         self.head = SimpleNamespace(sha=head_sha)
         self.user = SimpleNamespace(login="pull-author")
         self.create_review_calls: list[dict[str, object]] = []
-        self._reviews = [SimpleNamespace(body=body) for body in review_bodies or []]
+        self._reviews = [
+            SimpleNamespace(body=body, user=SimpleNamespace(login=reviewer_login))
+            for body in review_bodies or []
+        ]
 
     def create_review(self, **kwargs: object) -> None:
         self.create_review_calls.append(kwargs)
@@ -74,12 +78,14 @@ def make_assessment(
 def make_provider(
     head_sha: str = "analyzed-head",
     review_bodies: list[str] | None = None,
+    reviewer_login: str = "pr-agent[bot]",
     collaborators: set[str] | None = None,
 ) -> tuple[GithubProvider, FakePullRequest]:
-    pull_request = FakePullRequest(head_sha, review_bodies)
+    pull_request = FakePullRequest(head_sha, review_bodies, reviewer_login)
     provider = GithubProvider.__new__(GithubProvider)
     provider.pr = pull_request
     provider.repo = "owner/repo"
+    provider.github_user_id = "pr-agent[bot]"
     provider.max_comment_chars = 65000
     provider._get_pr = lambda: pull_request
     provider._get_repo = lambda: FakeRepository(collaborators)
@@ -203,6 +209,19 @@ def test_publish_review_decision_skips_an_exact_same_head_marker() -> None:
     provider.publish_review_decision(make_assessment([]), "analyzed-head")
 
     assert pull_request.create_review_calls == []
+
+
+def test_publish_review_decision_ignores_same_head_marker_from_other_user() -> None:
+    provider, pull_request = make_provider(
+        review_bodies=[
+            "Guide\n\n<!-- pr-agent-review-decision:sha=analyzed-head;policy=1 -->"
+        ],
+        reviewer_login="other-user",
+    )
+
+    provider.publish_review_decision(make_assessment([]), "analyzed-head")
+
+    assert len(pull_request.create_review_calls) == 1
 
 
 def test_publish_review_decision_posts_for_a_new_head_despite_old_marker() -> None:

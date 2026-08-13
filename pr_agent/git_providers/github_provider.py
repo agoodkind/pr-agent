@@ -594,7 +594,13 @@ class GithubProvider(GitProvider):
 
     def _has_review_decision_for_head(self, analyzed_head_sha: str) -> bool:
         marker = self._review_decision_marker(analyzed_head_sha)
+        bot_login = self.get_user_id()
+        if not bot_login:
+            return False
         for review in self.pr.get_reviews():
+            review_user = getattr(review, "user", None)
+            if getattr(review_user, "login", None) != bot_login:
+                continue
             if marker in (getattr(review, "body", "") or ""):
                 return True
         return False
