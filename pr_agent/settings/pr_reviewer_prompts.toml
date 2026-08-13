@@ -305,6 +305,9 @@ The PR code diff:
 
 
 {%- if duplicate_prompt_examples %}
+{%- if publish_review_decision | default(false) %}
+Include an `importance` value from 1 to 10 for every issue.
+{%- endif %}
 
 
 Example output:

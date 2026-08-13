@@ -196,6 +196,19 @@ class PRReviewer:
                     reason += ": no major issues detected."
                 get_logger().info(reason)
                 get_settings().data = {"artifact": pr_review}
+                if get_settings().config.publish_output:
+                    review_thread_kwargs = {"as_thread": True} if self.git_provider.should_publish_review_as_thread() else {}
+                    if get_settings().pr_reviewer.persistent_comment and not self.incremental.is_incremental:
+                        final_update_message = get_settings().pr_reviewer.final_update_message
+                        self.git_provider.publish_persistent_comment(
+                            pr_review,
+                            initial_header=f"{PRReviewHeader.REGULAR.value} 🔍",
+                            update_header=True,
+                            final_update_message=final_update_message,
+                            **review_thread_kwargs,
+                        )
+                    else:
+                        self.git_provider.publish_comment(pr_review, **review_thread_kwargs)
                 if should_publish_review_decision:
                     self.git_provider.publish_review_decision(
                         self.review_assessment,

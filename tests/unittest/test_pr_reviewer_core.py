@@ -629,6 +629,9 @@ async def test_run_publishes_decision_when_guide_output_is_suppressed(monkeypatc
     from pr_agent.tools import pr_reviewer as pr_reviewer_module
 
     git_provider = MagicMock()
+    publication_order: list[str] = []
+    git_provider.publish_persistent_comment.side_effect = lambda *args, **kwargs: publication_order.append("guide")
+    git_provider.publish_review_decision.side_effect = lambda *args, **kwargs: publication_order.append("decision")
     git_provider.get_files.return_value = ["src/changed.py"]
     git_provider.pr = SimpleNamespace(head=SimpleNamespace(sha="analyzed-head"))
     reviewer = _make_reviewer(git_provider)
@@ -671,7 +674,8 @@ async def test_run_publishes_decision_when_guide_output_is_suppressed(monkeypatc
         settings.pr_reviewer.publish_output_no_suggestions = original["publish_output_no_suggestions"]
         settings.github.publish_review_decision = original["publish_review_decision"]
 
-    git_provider.publish_persistent_comment.assert_not_called()
+    assert publication_order == ["guide", "decision"]
+    git_provider.publish_persistent_comment.assert_called_once()
     git_provider.publish_review_decision.assert_called_once_with(
         reviewer.review_assessment, "analyzed-head"
     )

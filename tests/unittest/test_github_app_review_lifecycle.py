@@ -186,7 +186,7 @@ def test_disabled_lifecycle_preserves_command_order_and_returns_aggregate(monkey
 
 def test_review_pr_alias_enables_decision_publication(monkeypatch):
     settings = _Settings(["/review_pr"])
-    _requester, _provider_urls = _install_environment(monkeypatch, settings)
+    _install_environment(monkeypatch, settings)
     agent = _Agent([True])
 
     result = _run(agent)
