@@ -10,8 +10,9 @@ HEAD_SHA = "abc123"
 
 
 class _Settings:
-    def __init__(self, commands, publish_lifecycle=True, timeout_seconds=1):
+    def __init__(self, commands, publish_lifecycle=True, timeout_seconds=1, push_commands=None):
         self.commands = commands
+        self.push_commands = push_commands or []
         self.config = SimpleNamespace(disable_auto_feedback=False)
         self.github = SimpleNamespace(
             publish_review_lifecycle=publish_lifecycle,
@@ -22,6 +23,8 @@ class _Settings:
     def get(self, key):
         if key == "github_app.pr_commands":
             return self.commands
+        if key == "github_app.push_commands":
+            return self.push_commands
         raise AssertionError(f"Unexpected settings key: {key}")
 
     def set(self, key, value):
@@ -45,8 +48,8 @@ class _Agent:
         self.outcomes = deque(outcomes)
         self.commands = []
 
-    async def handle_request(self, api_url, command):
-        self.commands.append((api_url, command))
+    async def handle_request(self, api_url, command, publish_review_decision=False):
+        self.commands.append((api_url, command, publish_review_decision))
         outcome = self.outcomes.popleft()
         if isinstance(outcome, Exception):
             raise outcome
@@ -55,8 +58,8 @@ class _Agent:
         return outcome
 
 
-def _body():
-    return {"pull_request": {"head": {"sha": HEAD_SHA}}}
+def _body(head_sha=HEAD_SHA):
+    return {"pull_request": {"head": {"sha": head_sha}}}
 
 
 def _install_environment(monkeypatch, settings):
@@ -96,7 +99,10 @@ def test_automatic_commands_publish_success_for_the_webhook_head(monkeypatch):
 
     assert result is True
     assert provider_urls == [API_URL]
-    assert agent.commands == [(API_URL, "/review"), (API_URL, "/improve")]
+    assert agent.commands == [
+        (API_URL, "/review", True),
+        (API_URL, "/improve", False),
+    ]
     assert requester.requests == [
         (
             "POST",
@@ -124,7 +130,10 @@ def test_false_command_result_publishes_failure_after_all_commands(monkeypatch):
     result = _run(agent)
 
     assert result is False
-    assert agent.commands == [(API_URL, "/review"), (API_URL, "/improve")]
+    assert agent.commands == [
+        (API_URL, "/review", True),
+        (API_URL, "/improve", False),
+    ]
     assert requester.requests[-1][2]["conclusion"] == "failure"
 
 
@@ -136,7 +145,7 @@ def test_command_exception_publishes_failure(monkeypatch):
     result = _run(agent)
 
     assert result is False
-    assert agent.commands == [(API_URL, "/review")]
+    assert agent.commands == [(API_URL, "/review", True)]
     assert requester.requests[-1][2]["conclusion"] == "failure"
 
 
@@ -169,4 +178,47 @@ def test_disabled_lifecycle_preserves_command_order_and_returns_aggregate(monkey
     result = _run(agent)
 
     assert result is False
-    assert agent.commands == [(API_URL, "/review"), (API_URL, "/improve")]
+    assert agent.commands == [
+        (API_URL, "/review", True),
+        (API_URL, "/improve", False),
+    ]
+
+
+def test_review_pr_alias_enables_decision_publication(monkeypatch):
+    settings = _Settings(["/review_pr"])
+    _requester, _provider_urls = _install_environment(monkeypatch, settings)
+    agent = _Agent([True])
+
+    result = _run(agent)
+
+    assert result is True
+    assert agent.commands == [(API_URL, "/review_pr", True)]
+
+
+def test_decision_write_failure_concludes_the_automatic_lifecycle(monkeypatch):
+    settings = _Settings(["/review"])
+    requester, _provider_urls = _install_environment(monkeypatch, settings)
+    agent = _Agent([False])
+
+    result = _run(agent)
+
+    assert result is False
+    assert agent.commands == [(API_URL, "/review", True)]
+    assert requester.requests[-1][2]["conclusion"] == "failure"
+
+
+def test_synchronize_lifecycle_uses_the_new_webhook_head(monkeypatch):
+    new_head = "new-head"
+    settings = _Settings([], push_commands=["/review"])
+    requester, _provider_urls = _install_environment(monkeypatch, settings)
+    agent = _Agent([True])
+
+    result = asyncio.run(
+        github_app._perform_auto_commands_github(
+            "push_commands", agent, _body(new_head), API_URL, {}
+        )
+    )
+
+    assert result is True
+    assert agent.commands == [(API_URL, "/review", True)]
+    assert requester.requests[0][2]["head_sha"] == new_head

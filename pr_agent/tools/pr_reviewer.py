@@ -134,6 +134,13 @@ class PRReviewer:
 
     async def run(self) -> None:
         init_run_details()
+        should_publish_review_decision = (
+            getattr(self, "publish_review_decision", False)
+            and get_settings().github.publish_review_decision
+        )
+        analyzed_head_sha = None
+        if should_publish_review_decision:
+            analyzed_head_sha = self.git_provider.pr.head.sha
         try:
             if not self.git_provider.get_files():
                 get_logger().info(f"PR has no files: {self.pr_url}, skipping review")
@@ -206,10 +213,19 @@ class PRReviewer:
             else:
                 self.git_provider.publish_comment(pr_review, **review_thread_kwargs)
 
+            if should_publish_review_decision:
+                self.git_provider.publish_review_decision(
+                    self.review_assessment,
+                    analyzed_head_sha,
+                )
+
             self.git_provider.remove_initial_comment()
         except Exception as e:
             get_logger().error(f"Failed to review PR: {e}")
-            if get_settings().config.get("propagate_tool_errors", False):
+            if (
+                should_publish_review_decision
+                or get_settings().config.get("propagate_tool_errors", False)
+            ):
                 raise
 
     def _should_publish_review_no_suggestions(self, pr_review: str) -> bool:

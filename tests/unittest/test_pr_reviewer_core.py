@@ -481,6 +481,111 @@ async def test_run_threads_only_the_final_review_comment(monkeypatch, persistent
     git_provider.publish_comment.assert_any_call("Preparing review...", is_temporary=True)
 
 
+@pytest.mark.asyncio
+async def test_run_publishes_the_guide_before_the_github_decision(monkeypatch):
+    from pr_agent.tools import pr_reviewer as pr_reviewer_module
+
+    event_log = []
+    git_provider = MagicMock()
+    git_provider.get_files.return_value = ["src/changed.py"]
+    git_provider.should_publish_review_as_thread.return_value = False
+    git_provider.pr = SimpleNamespace(head=SimpleNamespace(sha="analyzed-head"))
+    git_provider.publish_persistent_comment.side_effect = lambda *args, **kwargs: event_log.append("guide")
+    git_provider.publish_review_decision.side_effect = lambda *args, **kwargs: event_log.append("decision")
+    reviewer = _make_reviewer(git_provider)
+    reviewer.incremental = SimpleNamespace(is_incremental=False)
+    reviewer.vars = {}
+    reviewer.prediction = None
+    reviewer.publish_review_decision = True
+    reviewer.review_assessment = SimpleNamespace()
+    reviewer._prepare_pr_review = lambda: "## PR Reviewer Guide"
+
+    async def fake_extract_tickets(git_provider, vars):
+        return None
+
+    async def fake_retry(prepare_fn, model_type=None):
+        reviewer.prediction = "prediction"
+
+    monkeypatch.setattr(pr_reviewer_module, "extract_and_cache_pr_tickets", fake_extract_tickets)
+    monkeypatch.setattr(pr_reviewer_module, "retry_with_fallback_models", fake_retry)
+
+    settings = get_settings()
+    original = {
+        "publish_output": settings.config.publish_output,
+        "persistent_comment": settings.pr_reviewer.persistent_comment,
+        "is_auto_command": settings.config.get("is_auto_command", False),
+        "publish_review_decision": settings.github.publish_review_decision,
+    }
+    try:
+        settings.config.publish_output = True
+        settings.config.is_auto_command = False
+        settings.pr_reviewer.persistent_comment = True
+        settings.github.publish_review_decision = True
+
+        await reviewer.run()
+    finally:
+        settings.config.publish_output = original["publish_output"]
+        settings.config.is_auto_command = original["is_auto_command"]
+        settings.pr_reviewer.persistent_comment = original["persistent_comment"]
+        settings.github.publish_review_decision = original["publish_review_decision"]
+
+    assert event_log == ["guide", "decision"]
+    git_provider.publish_review_decision.assert_called_once_with(
+        reviewer.review_assessment, "analyzed-head"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_reraises_a_required_decision_publication_failure(monkeypatch):
+    from pr_agent.tools import pr_reviewer as pr_reviewer_module
+
+    git_provider = MagicMock()
+    git_provider.get_files.return_value = ["src/changed.py"]
+    git_provider.should_publish_review_as_thread.return_value = False
+    git_provider.pr = SimpleNamespace(head=SimpleNamespace(sha="analyzed-head"))
+    git_provider.publish_review_decision.side_effect = RuntimeError("decision write failed")
+    reviewer = _make_reviewer(git_provider)
+    reviewer.incremental = SimpleNamespace(is_incremental=False)
+    reviewer.vars = {}
+    reviewer.prediction = None
+    reviewer.publish_review_decision = True
+    reviewer.review_assessment = SimpleNamespace()
+    reviewer._prepare_pr_review = lambda: "## PR Reviewer Guide"
+
+    async def fake_extract_tickets(git_provider, vars):
+        return None
+
+    async def fake_retry(prepare_fn, model_type=None):
+        reviewer.prediction = "prediction"
+
+    monkeypatch.setattr(pr_reviewer_module, "extract_and_cache_pr_tickets", fake_extract_tickets)
+    monkeypatch.setattr(pr_reviewer_module, "retry_with_fallback_models", fake_retry)
+
+    settings = get_settings()
+    original = {
+        "publish_output": settings.config.publish_output,
+        "persistent_comment": settings.pr_reviewer.persistent_comment,
+        "is_auto_command": settings.config.get("is_auto_command", False),
+        "publish_review_decision": settings.github.publish_review_decision,
+    }
+    try:
+        settings.config.publish_output = True
+        settings.config.is_auto_command = False
+        settings.pr_reviewer.persistent_comment = True
+        settings.github.publish_review_decision = True
+
+        with pytest.raises(RuntimeError, match="decision write failed"):
+            await reviewer.run()
+    finally:
+        settings.config.publish_output = original["publish_output"]
+        settings.config.is_auto_command = original["is_auto_command"]
+        settings.pr_reviewer.persistent_comment = original["persistent_comment"]
+        settings.github.publish_review_decision = original["publish_review_decision"]
+
+    git_provider.publish_persistent_comment.assert_called_once()
+    git_provider.publish_review_decision.assert_called_once()
+
+
 def test_init_maps_user_question_and_answer_to_correct_prompt_vars(monkeypatch):
     """Behavioral regression for the swapped-unpacking bug (#2496).
 

@@ -117,8 +117,17 @@ async def handle_comments_on_pr(body: Dict[str, Any],
     with get_logger().contextualize(**log_context):
         if get_identity_provider().verify_eligibility("github", sender_id, api_url) is not Eligibility.NOT_ELIGIBLE:
             get_logger().info(f"Processing comment on PR {api_url=}, comment_body={comment_body}")
-            await agent.handle_request(api_url, comment_body,
-                        notify=lambda: provider.add_eyes_reaction(comment_id, disable_eyes=disable_eyes))
+            command = comment_body.lstrip().split(maxsplit=1)[0].lower()
+            publish_review_decision = (
+                command == "/review"
+                and getattr(provider, "can_publish_review_decision", lambda _sender: False)(sender)
+            )
+            await agent.handle_request(
+                api_url,
+                comment_body,
+                notify=lambda: provider.add_eyes_reaction(comment_id, disable_eyes=disable_eyes),
+                publish_review_decision=publish_review_decision,
+            )
         else:
             get_logger().info(f"User {sender=} is not eligible to process comment on PR {api_url=}")
 
@@ -416,7 +425,12 @@ async def _perform_auto_commands_github(commands_conf: str, agent: PRAgent, body
             other_args = update_settings_from_args(args)
             new_command = ' '.join([command] + other_args)
             get_logger().info(f"{commands_conf}. Performing auto command '{new_command}', for {api_url=}")
-            command_succeeded = await agent.handle_request(api_url, new_command)
+            publish_review_decision = command.lower() in {"/review", "/review_pr"}
+            command_succeeded = await agent.handle_request(
+                api_url,
+                new_command,
+                publish_review_decision=publish_review_decision,
+            )
             if not command_succeeded:
                 all_commands_succeeded = False
         return all_commands_succeeded
