@@ -639,10 +639,10 @@ async def test_run_publishes_decision_when_guide_output_is_suppressed(monkeypatc
     reviewer.review_assessment = SimpleNamespace()
     reviewer._prepare_pr_review = lambda: "No major issues detected"
 
-    async def fake_extract_tickets(git_provider, vars):
+    async def fake_extract_tickets(_git_provider, _vars):
         return None
 
-    async def fake_retry(prepare_fn, model_type=None):
+    async def fake_retry(_prepare_fn, **_kwargs):
         reviewer.prediction = "prediction"
 
     monkeypatch.setattr(pr_reviewer_module, "extract_and_cache_pr_tickets", fake_extract_tickets)
@@ -745,7 +745,7 @@ def test_review_decision_prompt_includes_importance_only_when_enabled(
             publish_review_decision=publish_review_decision,
             ai_handler=lambda: SimpleNamespace(main_pr_language=None),
         )
-        prompt = Environment(undefined=StrictUndefined).from_string(
+        prompt = Environment(undefined=StrictUndefined, autoescape=True).from_string(
             get_settings().pr_review_prompt.system
         ).render(reviewer.vars)
     finally:
