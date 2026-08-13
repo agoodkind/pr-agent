@@ -169,6 +169,26 @@ def test_publish_review_decision_anchors_a_contextual_finding_to_a_changed_line(
     ]
 
 
+def test_publish_review_decision_normalizes_inline_finding_paths() -> None:
+    provider, pull_request = make_provider()
+    assessment = make_assessment([make_finding(" src/changed.py\n", 1, 1)])
+
+    provider.publish_review_decision(assessment, "analyzed-head")
+
+    assert pull_request.create_review_calls[0]["comments"] == [
+        {
+            "body": (
+                "**Incorrect result**\n\n"
+                "The endpoint returns the wrong result for this input.\n\n"
+                "Importance: 8"
+            ),
+            "path": "src/changed.py",
+            "line": 1,
+            "side": "RIGHT",
+        }
+    ]
+
+
 def test_publish_review_decision_keeps_invalid_inline_findings_in_body() -> None:
     provider, pull_request = make_provider()
     assessment = make_assessment(
