@@ -102,6 +102,9 @@ class KeyIssuesComponentLink(BaseModel):
     issue_content: str = Field(description="A short and concise description of the issue, why it matters, and the specific scenario or input that triggers it. Do not mention line numbers in this field.")
     start_line: int = Field(description="The start line that corresponds to this issue in the relevant file")
     end_line: int = Field(description="The end line that corresponds to this issue in the relevant file")
+{%- if publish_review_decision | default(false) %}
+    importance: int = Field(description="Rate the issue importance from 1 to 10, where 10 requires changes before merge.")
+{%- endif %}
 
 {%- if require_todo_scan %}
 class TodoSection(BaseModel):
@@ -197,6 +200,9 @@ review:
         ...
       start_line: 12
       end_line: 14
+{%- if publish_review_decision | default(false) %}
+      importance: 7
+{%- endif %}
     - ...
   security_concerns: |
     No
@@ -299,6 +305,9 @@ The PR code diff:
 
 
 {%- if duplicate_prompt_examples %}
+{%- if publish_review_decision | default(false) %}
+Include an `importance` value from 1 to 10 for every issue.
+{%- endif %}
 
 
 Example output:

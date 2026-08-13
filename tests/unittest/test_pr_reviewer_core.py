@@ -1,8 +1,12 @@
+from __future__ import annotations
+
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from jinja2 import Environment, StrictUndefined
 
+from pr_agent.algo.review_decision import ReviewEvent
 from pr_agent.config_loader import get_settings
 from pr_agent.tools.pr_reviewer import PRReviewer
 
@@ -20,6 +24,8 @@ def _make_prediction_reviewer(git_provider=None):
     reviewer.remaining_files_list = []
     reviewer.incremental = SimpleNamespace(is_incremental=False)
     reviewer.prediction = None
+    reviewer.publish_review_decision = False
+    reviewer.review_assessment = None
     return reviewer
 
 
@@ -172,6 +178,208 @@ def test_prepare_pr_review_reports_number_of_files_beyond_coverage_limit():
     assert "- `file_50.py`" not in review
 
 
+def test_prepare_pr_review_keeps_assessment_after_markdown_rendering_mutates_data(monkeypatch):
+    reviewer = _make_prediction_reviewer()
+    reviewer.publish_review_decision = True
+    monkeypatch.setattr(get_settings().github, "publish_review_decision", True)
+    reviewer.remaining_files_list = []
+    reviewer.prediction = "review: {}"
+    review_data = {
+        "review": {
+            "key_issues_to_review": [
+                {
+                    "relevant_file": "src/example.py",
+                    "issue_header": "Possible bug",
+                    "issue_content": "A realistic input triggers the issue.",
+                    "start_line": 10,
+                    "end_line": 12,
+                    "importance": 6,
+                }
+            ]
+        }
+    }
+    reviewer.git_provider.get_diff_files.return_value = []
+    reviewer.git_provider.is_supported.return_value = False
+    reviewer.set_review_labels = MagicMock()
+
+    def render_and_mutate(data, *args, **kwargs):
+        data["review"].clear()
+        return "original review"
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.load_yaml", return_value=review_data),
+        patch("pr_agent.tools.pr_reviewer.github_action_output"),
+        patch("pr_agent.tools.pr_reviewer.convert_to_markdown_v2", side_effect=render_and_mutate),
+    ):
+        review = reviewer._prepare_pr_review()
+
+    assert review == "original review"
+    assert reviewer.review_assessment is not None
+    assert reviewer.review_assessment.event is ReviewEvent.COMMENT
+    assert reviewer.review_assessment.findings[0].importance == 6
+
+
+@pytest.mark.parametrize(
+    ("key_issues_to_review", "expected_event"),
+    [
+        (
+            [
+                {
+                    "relevant_file": "src/critical.py",
+                    "issue_header": "Data loss",
+                    "issue_content": "A valid request deletes stored data.",
+                    "start_line": 10,
+                    "end_line": 12,
+                    "importance": 7,
+                },
+                {
+                    "relevant_file": "src/secondary.py",
+                    "issue_header": "Malformed importance",
+                    "issue_content": "The model returned text instead of an integer.",
+                    "start_line": 20,
+                    "end_line": 22,
+                    "importance": "high",
+                },
+            ],
+            ReviewEvent.REQUEST_CHANGES,
+        ),
+        (
+            [
+                {
+                    "relevant_file": "src/secondary.py",
+                    "issue_header": "Malformed importance",
+                    "issue_content": "The model returned text instead of an integer.",
+                    "start_line": 20,
+                    "end_line": 22,
+                    "importance": "high",
+                },
+            ],
+            ReviewEvent.COMMENT,
+        ),
+    ],
+)
+def test_prepare_pr_review_keeps_malformed_findings_in_decision_policy(
+    monkeypatch, key_issues_to_review, expected_event
+):
+    reviewer = _make_prediction_reviewer()
+    reviewer.publish_review_decision = True
+    monkeypatch.setattr(get_settings().github, "publish_review_decision", True)
+    reviewer.prediction = "review: {}"
+    reviewer.git_provider.get_diff_files.return_value = []
+    reviewer.git_provider.is_supported.return_value = False
+    reviewer.set_review_labels = MagicMock()
+
+    with (
+        patch(
+            "pr_agent.tools.pr_reviewer.load_yaml",
+            return_value={"review": {"key_issues_to_review": key_issues_to_review}},
+        ),
+        patch("pr_agent.tools.pr_reviewer.github_action_output"),
+        patch("pr_agent.tools.pr_reviewer.convert_to_markdown_v2", return_value="original review"),
+    ):
+        reviewer._prepare_pr_review()
+
+    assert reviewer.review_assessment is not None
+    assert reviewer.review_assessment.event is expected_event
+    assert reviewer.review_assessment.has_invalid_findings is True
+
+
+def test_prepare_pr_review_assigns_the_complete_published_body_to_assessment(monkeypatch):
+    reviewer = _make_prediction_reviewer()
+    reviewer.publish_review_decision = True
+    monkeypatch.setattr(get_settings().github, "publish_review_decision", True)
+    reviewer.prediction = "review: {}"
+    reviewer.remaining_files_list = ["skipped.py"]
+    reviewer.git_provider.get_diff_files.return_value = []
+    reviewer.git_provider.is_supported.return_value = True
+    reviewer.set_review_labels = MagicMock()
+    settings = get_settings()
+    original = {
+        "enable_review_coverage_footer": settings.pr_reviewer.enable_review_coverage_footer,
+        "enable_help_text": settings.pr_reviewer.enable_help_text,
+        "output_relevant_configurations": settings.config.output_relevant_configurations,
+        "output_run_details": settings.config.output_run_details,
+    }
+
+    try:
+        settings.pr_reviewer.enable_review_coverage_footer = True
+        settings.pr_reviewer.enable_help_text = True
+        settings.config.output_relevant_configurations = True
+        settings.config.output_run_details = True
+        with (
+            patch(
+                "pr_agent.tools.pr_reviewer.load_yaml",
+                return_value={"review": {"key_issues_to_review": []}},
+            ),
+            patch("pr_agent.tools.pr_reviewer.github_action_output"),
+            patch("pr_agent.tools.pr_reviewer.convert_to_markdown_v2", return_value="original review"),
+            patch("pr_agent.tools.pr_reviewer.HelpMessage.get_review_usage_guide", return_value="help text"),
+            patch("pr_agent.tools.pr_reviewer.show_relevant_configurations", return_value="config text"),
+            patch("pr_agent.tools.pr_reviewer.show_run_details", return_value="run details"),
+        ):
+            review = reviewer._prepare_pr_review()
+    finally:
+        settings.pr_reviewer.enable_review_coverage_footer = original["enable_review_coverage_footer"]
+        settings.pr_reviewer.enable_help_text = original["enable_help_text"]
+        settings.config.output_relevant_configurations = original["output_relevant_configurations"]
+        settings.config.output_run_details = original["output_run_details"]
+
+    assert reviewer.review_assessment is not None
+    assert reviewer.review_assessment.body == review
+    assert review == (
+        "original review\n\n<hr>\n\n"
+        "⚠️ **Review coverage:** The following files were not included in this review "
+        "because of the token budget:\n"
+        "- `skipped.py`<hr>\n\n<details> <summary><strong>💡 Tool usage guide:"
+        "</strong></summary><hr> \n\nhelp text\n</details>\nconfig textrun details"
+    )
+
+
+def test_prepare_pr_review_disabled_mode_keeps_current_guide_without_assessment():
+    reviewer = _make_prediction_reviewer()
+    reviewer.publish_review_decision = False
+
+    review = _render_review(reviewer, [])
+
+    assert review == "original review"
+    assert reviewer.review_assessment is None
+
+
+def test_prepare_pr_review_does_not_assess_when_configuration_disables_decisions(monkeypatch):
+    reviewer = _make_prediction_reviewer()
+    reviewer.publish_review_decision = True
+    reviewer.prediction = "review: {}"
+    reviewer.git_provider.get_diff_files.return_value = []
+    reviewer.git_provider.is_supported.return_value = False
+    reviewer.set_review_labels = MagicMock()
+    monkeypatch.setattr(get_settings().github, "publish_review_decision", False)
+
+    with (
+        patch(
+            "pr_agent.tools.pr_reviewer.load_yaml",
+            return_value={
+                "review": {
+                    "key_issues_to_review": [
+                        {
+                            "relevant_file": "src/example.py",
+                            "issue_header": "A finding",
+                            "issue_content": "A finding should remain a normal review item.",
+                            "start_line": 10,
+                            "end_line": 10,
+                            "importance": 8,
+                        }
+                    ]
+                }
+            },
+        ),
+        patch("pr_agent.tools.pr_reviewer.github_action_output"),
+        patch("pr_agent.tools.pr_reviewer.convert_to_markdown_v2", return_value="original review"),
+    ):
+        reviewer._prepare_pr_review()
+
+    assert reviewer.review_assessment is None
+
+
 def test_should_publish_review_no_suggestions_respects_config():
     reviewer = _make_reviewer()
     settings = get_settings()
@@ -311,6 +519,168 @@ async def test_run_threads_only_the_final_review_comment(monkeypatch, persistent
     git_provider.publish_comment.assert_any_call("Preparing review...", is_temporary=True)
 
 
+@pytest.mark.asyncio
+async def test_run_publishes_the_guide_before_the_github_decision(monkeypatch):
+    from pr_agent.tools import pr_reviewer as pr_reviewer_module
+
+    event_log = []
+    git_provider = MagicMock()
+    git_provider.get_files.return_value = ["src/changed.py"]
+    git_provider.should_publish_review_as_thread.return_value = False
+    git_provider.pr = SimpleNamespace(head=SimpleNamespace(sha="analyzed-head"))
+    git_provider.publish_persistent_comment.side_effect = lambda *args, **kwargs: event_log.append("guide")
+    git_provider.publish_review_decision.side_effect = lambda *args, **kwargs: event_log.append("decision")
+    reviewer = _make_reviewer(git_provider)
+    reviewer.incremental = SimpleNamespace(is_incremental=False)
+    reviewer.vars = {}
+    reviewer.prediction = None
+    reviewer.publish_review_decision = True
+    reviewer.review_assessment = SimpleNamespace()
+    reviewer._prepare_pr_review = lambda: "## PR Reviewer Guide"
+
+    async def fake_extract_tickets(git_provider, vars):
+        return None
+
+    async def fake_retry(prepare_fn, model_type=None):
+        reviewer.prediction = "prediction"
+
+    monkeypatch.setattr(pr_reviewer_module, "extract_and_cache_pr_tickets", fake_extract_tickets)
+    monkeypatch.setattr(pr_reviewer_module, "retry_with_fallback_models", fake_retry)
+
+    settings = get_settings()
+    original = {
+        "publish_output": settings.config.publish_output,
+        "persistent_comment": settings.pr_reviewer.persistent_comment,
+        "is_auto_command": settings.config.get("is_auto_command", False),
+        "publish_review_decision": settings.github.publish_review_decision,
+    }
+    try:
+        settings.config.publish_output = True
+        settings.config.is_auto_command = False
+        settings.pr_reviewer.persistent_comment = True
+        settings.github.publish_review_decision = True
+
+        await reviewer.run()
+    finally:
+        settings.config.publish_output = original["publish_output"]
+        settings.config.is_auto_command = original["is_auto_command"]
+        settings.pr_reviewer.persistent_comment = original["persistent_comment"]
+        settings.github.publish_review_decision = original["publish_review_decision"]
+
+    assert event_log == ["guide", "decision"]
+    git_provider.publish_review_decision.assert_called_once_with(
+        reviewer.review_assessment, "analyzed-head"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_reraises_a_required_decision_publication_failure(monkeypatch):
+    from pr_agent.tools import pr_reviewer as pr_reviewer_module
+
+    git_provider = MagicMock()
+    git_provider.get_files.return_value = ["src/changed.py"]
+    git_provider.should_publish_review_as_thread.return_value = False
+    git_provider.pr = SimpleNamespace(head=SimpleNamespace(sha="analyzed-head"))
+    git_provider.publish_review_decision.side_effect = RuntimeError("decision write failed")
+    reviewer = _make_reviewer(git_provider)
+    reviewer.incremental = SimpleNamespace(is_incremental=False)
+    reviewer.vars = {}
+    reviewer.prediction = None
+    reviewer.publish_review_decision = True
+    reviewer.review_assessment = SimpleNamespace()
+    reviewer._prepare_pr_review = lambda: "## PR Reviewer Guide"
+
+    async def fake_extract_tickets(git_provider, vars):
+        return None
+
+    async def fake_retry(prepare_fn, model_type=None):
+        reviewer.prediction = "prediction"
+
+    monkeypatch.setattr(pr_reviewer_module, "extract_and_cache_pr_tickets", fake_extract_tickets)
+    monkeypatch.setattr(pr_reviewer_module, "retry_with_fallback_models", fake_retry)
+
+    settings = get_settings()
+    original = {
+        "publish_output": settings.config.publish_output,
+        "persistent_comment": settings.pr_reviewer.persistent_comment,
+        "is_auto_command": settings.config.get("is_auto_command", False),
+        "publish_review_decision": settings.github.publish_review_decision,
+    }
+    try:
+        settings.config.publish_output = True
+        settings.config.is_auto_command = False
+        settings.pr_reviewer.persistent_comment = True
+        settings.github.publish_review_decision = True
+
+        with pytest.raises(RuntimeError, match="decision write failed"):
+            await reviewer.run()
+    finally:
+        settings.config.publish_output = original["publish_output"]
+        settings.config.is_auto_command = original["is_auto_command"]
+        settings.pr_reviewer.persistent_comment = original["persistent_comment"]
+        settings.github.publish_review_decision = original["publish_review_decision"]
+
+    git_provider.publish_persistent_comment.assert_called_once()
+    git_provider.publish_review_decision.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_run_publishes_decision_when_guide_output_is_suppressed(monkeypatch):
+    from pr_agent.tools import pr_reviewer as pr_reviewer_module
+
+    git_provider = MagicMock()
+    publication_order: list[str] = []
+    git_provider.publish_persistent_comment.side_effect = lambda *args, **kwargs: publication_order.append("guide")
+    git_provider.publish_review_decision.side_effect = lambda *args, **kwargs: publication_order.append("decision")
+    git_provider.get_files.return_value = ["src/changed.py"]
+    git_provider.pr = SimpleNamespace(head=SimpleNamespace(sha="analyzed-head"))
+    reviewer = _make_reviewer(git_provider)
+    reviewer.incremental = SimpleNamespace(is_incremental=False)
+    reviewer.vars = {}
+    reviewer.prediction = None
+    reviewer.publish_review_decision = True
+    reviewer.review_assessment = SimpleNamespace()
+    reviewer._prepare_pr_review = lambda: "No major issues detected"
+
+    async def fake_extract_tickets(_git_provider, _vars):
+        return None
+
+    async def fake_retry(_prepare_fn, **_kwargs):
+        reviewer.prediction = "prediction"
+
+    monkeypatch.setattr(pr_reviewer_module, "extract_and_cache_pr_tickets", fake_extract_tickets)
+    monkeypatch.setattr(pr_reviewer_module, "retry_with_fallback_models", fake_retry)
+
+    settings = get_settings()
+    original = {
+        "publish_output": settings.config.publish_output,
+        "persistent_comment": settings.pr_reviewer.persistent_comment,
+        "publish_output_no_suggestions": settings.pr_reviewer.publish_output_no_suggestions,
+        "is_auto_command": settings.config.get("is_auto_command", False),
+        "publish_review_decision": settings.github.publish_review_decision,
+    }
+    try:
+        settings.config.publish_output = True
+        settings.config.is_auto_command = False
+        settings.pr_reviewer.persistent_comment = True
+        settings.pr_reviewer.publish_output_no_suggestions = False
+        settings.github.publish_review_decision = True
+
+        await reviewer.run()
+    finally:
+        settings.config.publish_output = original["publish_output"]
+        settings.config.is_auto_command = original["is_auto_command"]
+        settings.pr_reviewer.persistent_comment = original["persistent_comment"]
+        settings.pr_reviewer.publish_output_no_suggestions = original["publish_output_no_suggestions"]
+        settings.github.publish_review_decision = original["publish_review_decision"]
+
+    assert publication_order == ["guide", "decision"]
+    git_provider.publish_persistent_comment.assert_called_once()
+    git_provider.publish_review_decision.assert_called_once_with(
+        reviewer.review_assessment, "analyzed-head"
+    )
+
+
 def test_init_maps_user_question_and_answer_to_correct_prompt_vars(monkeypatch):
     """Behavioral regression for the swapped-unpacking bug (#2496).
 
@@ -346,6 +716,46 @@ def test_init_maps_user_question_and_answer_to_correct_prompt_vars(monkeypatch):
 
     assert reviewer.vars["question_str"] == "Questions to better understand the PR:\n- Why?"
     assert reviewer.vars["answer_str"] == "/answer Because it fixes production."
+
+
+@pytest.mark.parametrize(
+    ("publish_review_decision", "config_publish_review_decision", "expects_importance"),
+    [(True, True, True), (True, False, False), (False, True, False), (False, False, False)],
+)
+def test_review_decision_prompt_includes_importance_only_when_enabled(
+    monkeypatch,
+    publish_review_decision,
+    config_publish_review_decision,
+    expects_importance,
+):
+    from pr_agent.tools import pr_reviewer as pr_reviewer_module
+
+    provider = MagicMock()
+    provider.is_supported.return_value = True
+    provider.get_languages.return_value = {}
+    provider.get_files.return_value = []
+    provider.get_pr_description.return_value = ("desc", [])
+
+    monkeypatch.setattr(pr_reviewer_module, "get_git_provider_with_context", lambda pr_url: provider)
+    monkeypatch.setattr(pr_reviewer_module, "get_main_pr_language", lambda languages, files: "Python")
+    monkeypatch.setattr(pr_reviewer_module, "TokenHandler", MagicMock())
+
+    settings = get_settings()
+    original_publish_review_decision = settings.github.publish_review_decision
+    settings.github.publish_review_decision = config_publish_review_decision
+    try:
+        reviewer = PRReviewer(
+            "https://example/pr/1",
+            publish_review_decision=publish_review_decision,
+            ai_handler=lambda: SimpleNamespace(main_pr_language=None),
+        )
+        prompt = Environment(undefined=StrictUndefined, autoescape=True).from_string(
+            get_settings().pr_review_prompt.system
+        ).render(reviewer.vars)
+    finally:
+        settings.github.publish_review_decision = original_publish_review_decision
+
+    assert ("importance: int" in prompt) is expects_importance
 
 
 def _build_answer_mode_reviewer(monkeypatch, issue_comments):

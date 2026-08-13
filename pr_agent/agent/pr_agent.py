@@ -52,7 +52,13 @@ class PRAgent:
     def __init__(self, ai_handler: partial[BaseAiHandler,] = LiteLLMAIHandler):
         self.ai_handler = ai_handler  # will be initialized in run_action
 
-    async def _handle_request(self, pr_url, request, notify=None) -> bool:
+    async def _handle_request(
+        self,
+        pr_url,
+        request,
+        notify=None,
+        publish_review_decision: bool = False,
+    ) -> bool:
         # First, apply repo specific settings if exists
         apply_repo_settings(pr_url)
 
@@ -110,6 +116,17 @@ class PRAgent:
                 await PRReviewer(pr_url, is_answer=True, args=args, ai_handler=self.ai_handler).run()
             elif action == "auto_review":
                 await PRReviewer(pr_url, is_auto=True, args=args, ai_handler=self.ai_handler).run()
+            elif action in ("review", "review_pr"):
+                if notify:
+                    notify()
+
+                reviewer_kwargs = {
+                    "ai_handler": self.ai_handler,
+                    "args": args,
+                }
+                if publish_review_decision:
+                    reviewer_kwargs["publish_review_decision"] = True
+                await PRReviewer(pr_url, **reviewer_kwargs).run()
             elif action in command2class:
                 if notify:
                     notify()
@@ -119,9 +136,20 @@ class PRAgent:
                 return False
             return True
 
-    async def handle_request(self, pr_url, request, notify=None) -> bool:
+    async def handle_request(
+        self,
+        pr_url,
+        request,
+        notify=None,
+        publish_review_decision: bool = False,
+    ) -> bool:
         try:
-            return await self._handle_request(pr_url, request, notify)
+            return await self._handle_request(
+                pr_url,
+                request,
+                notify,
+                publish_review_decision=publish_review_decision,
+            )
         except:
             get_logger().exception("Failed to process the command.")
             return False
