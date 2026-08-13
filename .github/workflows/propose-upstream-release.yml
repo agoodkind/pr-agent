@@ -77,6 +77,7 @@ jobs:
           GIT_COMMITTER_DATE=$(git show -s --format=%aI 'fork/lifecycle-v1^{commit}')
 
           if ! git cherry-pick fork/lifecycle-v1; then
+            git cherry-pick --abort >/dev/null 2>&1 || true
             printf 'The lifecycle patch conflicts with upstream release %s.\n' "$release_tag" >&2
             git status --short
             exit 1
@@ -84,6 +85,7 @@ jobs:
           GIT_COMMITTER_DATE=$(git show -s --format=%aI 'fork/review-decisions-v1^{commit}')
           export GIT_COMMITTER_DATE
           if ! git cherry-pick fork/review-decisions-v1; then
+            git cherry-pick --abort >/dev/null 2>&1 || true
             printf 'The review-decisions patch conflicts with upstream release %s.\n' "$release_tag" >&2
             git status --short
             exit 1
